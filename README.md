@@ -24,8 +24,8 @@ ame-ai: いろいろな会社の AI と API で話す。
   {"type":"error","message":…}                      失敗(終了コード 1)
   {"type":"done"}
 --mcp で選んだ stdio の MCP サーバを起動し、ツールをモデルに渡す。モデルが呼んだら実行して結果を返し、
-続きを答えさせる(12 往復まで)。API キーはコマンドラインに出さず curl の標準入力(-K -)で渡す。
-止めるときはプロセスグループごと(curl・MCP サーバも)止める。
+続きを答えさせる(12 往復まで)。API キーはコマンドラインに出さず ame-yatagarasu の標準入力(-K -。curl と同じ書き方)で渡す。
+止めるときはプロセスグループごと(ame-yatagarasu・MCP サーバも)止める。
 ```
 
 ## ビルド
@@ -35,7 +35,7 @@ zig build -Doptimize=ReleaseSafe   # zig-out/bin/ame-ai(Zig 0.13、libc だけ)
 zig build test
 ```
 
-実行に要るもの: `curl`
+実行に要るもの: `ame-yatagarasu`
 
 ## このリポジトリについて
 
