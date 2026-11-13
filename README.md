@@ -10,7 +10,7 @@ ame-shell は画面の要らない仕事を、1 つのことをして標準入�
 ```text
 ame-ai: いろいろな会社の AI と API で話す。
 
-  echo 質問 | ame-ai [-p 会社] [-m モデル] [-s 指示]            返事の文章を標準出力へ(届いた分から)
+  echo 質問 | ame-ai [-p 会社] [-m モデル] [-s 指示] [-i 画像]…  返事の文章を標準出力へ(届いた分から)
   ame-ai --json [-p …] [-m …] [-s …] [--mcp 名前,名前] < 会話.json  1 行 1 つの出来事(JSON)を標準出力へ
   ame-ai models [-p 会社]                                          その会社のモデルの id を 1 行ずつ
   ame-ai providers                                                 会社の id と名前
@@ -39,7 +39,7 @@ zig build test
 
 ## このリポジトリについて
 
-正本は ame-shell の `src/cmd/ame-ai.zig` と `src/lib/` です。このリポジトリは `scripts/split-repos.sh` が生成して同期しています。
+正本は ame-shell の `src/cmd/ame-ai.zig` です。このリポジトリは `scripts/split-repos.sh` が生成して同期しています。
 直したいところがあれば ame-shell の方へお願いします。
 
 ライセンス: GPL-3.0(ame-shell と同じ)

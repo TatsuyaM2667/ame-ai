@@ -75,6 +75,14 @@ pub fn readSmall(path: []const u8, buf: []u8) ?[]const u8 {
     const f = std.fs.cwd().openFile(path, .{}) catch return null;
     defer f.close();
     const n = f.readAll(buf) catch return null;
+    // 入れ物より大きいファイルは、途中で切った中身を使わない(後ろの行が黙って消えるので)
+    if (n == buf.len) {
+        var one: [1]u8 = undefined;
+        if ((f.read(&one) catch 0) > 0) {
+            std.log.warn("{s} が大きすぎます({d} バイトまで)", .{ path, buf.len });
+            return null;
+        }
+    }
     return buf[0..n];
 }
 
@@ -166,6 +174,9 @@ pub fn saveKey(alloc: std.mem.Allocator, i: usize, k: []const u8) bool {
 
 pub const Call = struct { id: []const u8, name: []const u8, args: []const u8 };
 
+/// 送る画像(base64 にしたもの)
+pub const Image = struct { mime: []const u8, b64: []const u8 };
+
 /// 会話の 1 つ。user / assistant(calls = そのあとに呼んだツール)/ tool(id の呼び出しの結果)
 pub const Turn = struct {
     role: enum { user, assistant, tool },
@@ -173,7 +184,19 @@ pub const Turn = struct {
     calls: []const Call = &.{},
     id: []const u8 = "",
     err: bool = false,
+    /// user に付けた画像のファイル(会話の JSON の "images")。読んで images にするのは ame-ai
+    image_paths: []const []const u8 = &.{},
+    images: []const Image = &.{},
 };
+
+/// 画像の種類(先頭のバイトで見分ける)。送れない形なら null
+pub fn mimeOf(b: []const u8) ?[]const u8 {
+    if (std.mem.startsWith(u8, b, "\x89PNG\r\n\x1a\n")) return "image/png";
+    if (std.mem.startsWith(u8, b, "\xff\xd8\xff")) return "image/jpeg";
+    if (std.mem.startsWith(u8, b, "GIF87a") or std.mem.startsWith(u8, b, "GIF89a")) return "image/gif";
+    if (b.len >= 12 and std.mem.eql(u8, b[0..4], "RIFF") and std.mem.eql(u8, b[8..12], "WEBP")) return "image/webp";
+    return null;
+}
 
 /// モデルに渡すツール(name は <サーバ>__<ツール>。schema は JSON の文字列)
 pub const ToolDef = struct { name: []const u8, description: []const u8, schema: []const u8 };
@@ -190,7 +213,11 @@ pub fn parseConversation(a: std.mem.Allocator, json: []const u8) ![]Turn {
         const role = getStr(e, "role") orelse continue;
         const content = getStr(e, "content") orelse "";
         if (std.mem.eql(u8, role, "user")) {
-            try out.append(.{ .role = .user, .content = content });
+            var paths = std.ArrayList([]const u8).init(a);
+            if (e.object.get("images")) |im| if (im == .array) for (im.array.items) |p| {
+                if (p == .string) try paths.append(p.string);
+            };
+            try out.append(.{ .role = .user, .content = content, .image_paths = paths.items });
         } else if (std.mem.eql(u8, role, "assistant")) {
             var calls = std.ArrayList(Call).init(a);
             if (e.object.get("tool_calls")) |tc| if (tc == .array) for (tc.array.items) |c| {
@@ -215,6 +242,50 @@ fn parseObj(a: std.mem.Allocator, s: []const u8) std.json.Value {
 fn findResult(turns: []const Turn, id: []const u8) ?Turn {
     for (turns) |t| if (t.role == .tool and std.mem.eql(u8, t.id, id)) return t;
     return null;
+}
+
+/// 画像つきの頼みごと: Anthropic は [{image(base64)}…, {text}]、OpenAI 互換は [{text}, {image_url(data URI)}…]
+fn writeUserParts(ws: anytype, proto: Proto, t: Turn, a: std.mem.Allocator) !void {
+    try ws.beginArray();
+    if (proto == .anthropic) {
+        for (t.images) |im| {
+            try ws.beginObject();
+            try ws.objectField("type");
+            try ws.write("image");
+            try ws.objectField("source");
+            try ws.beginObject();
+            try ws.objectField("type");
+            try ws.write("base64");
+            try ws.objectField("media_type");
+            try ws.write(im.mime);
+            try ws.objectField("data");
+            try ws.write(im.b64);
+            try ws.endObject();
+            try ws.endObject();
+        }
+    }
+    if (t.content.len > 0) {
+        try ws.beginObject();
+        try ws.objectField("type");
+        try ws.write("text");
+        try ws.objectField("text");
+        try ws.write(t.content);
+        try ws.endObject();
+    }
+    if (proto == .openai) {
+        for (t.images) |im| {
+            try ws.beginObject();
+            try ws.objectField("type");
+            try ws.write("image_url");
+            try ws.objectField("image_url");
+            try ws.beginObject();
+            try ws.objectField("url");
+            try ws.write(try std.fmt.allocPrint(a, "data:{s};base64,{s}", .{ im.mime, im.b64 }));
+            try ws.endObject();
+            try ws.endObject();
+        }
+    }
+    try ws.endArray();
 }
 
 /// 送る本文(JSON)を作る。結果の届いていないツールの呼び出しは送らない
@@ -250,12 +321,14 @@ pub fn buildBody(out: *std.ArrayList(u8), proto: Proto, mdl: []const u8, system:
         switch (t.role) {
             .tool => {}, // 呼び出しのあとにまとめて書く
             .user => {
-                if (t.content.len == 0) continue;
+                if (t.content.len == 0 and t.images.len == 0) continue;
                 try ws.beginObject();
                 try ws.objectField("role");
                 try ws.write("user");
                 try ws.objectField("content");
-                try ws.write(t.content);
+                if (t.images.len == 0) {
+                    try ws.write(t.content);
+                } else try writeUserParts(&ws, proto, t, a);
                 try ws.endObject();
             },
             .assistant => {
@@ -528,6 +601,13 @@ pub const CallBuilder = struct {
         return .{ .a = a, .parts = std.ArrayList(Part).init(a) };
     }
 
+    /// API 応答の "index"(i64)を u32 に。負や 2^32 以上は端に寄せる(@intCast だとパニック)
+    fn jsonIndex(x: ?std.json.Value, def: u32) u32 {
+        const v = x orelse return def;
+        if (v != .integer) return def;
+        return @intCast(std.math.clamp(v.integer, 0, std.math.maxInt(u32)));
+    }
+
     fn at(self: *CallBuilder, idx: u32) ?*Part {
         for (self.parts.items) |*p| if (p.index == idx) return p;
         self.parts.append(.{ .index = idx, .id = std.ArrayList(u8).init(self.a), .name = std.ArrayList(u8).init(self.a), .args = std.ArrayList(u8).init(self.a) }) catch return null;
@@ -539,7 +619,7 @@ pub const CallBuilder = struct {
         switch (proto) {
             .anthropic => {
                 const ty = getStr(v, "type") orelse return;
-                const idx: u32 = if (v.object.get("index")) |x| (if (x == .integer) @intCast(@max(0, x.integer)) else 0) else 0;
+                const idx = jsonIndex(v.object.get("index"), 0);
                 if (std.mem.eql(u8, ty, "content_block_start")) {
                     const cb = v.object.get("content_block") orelse return;
                     if (!std.mem.eql(u8, getStr(cb, "type") orelse "", "tool_use")) return;
@@ -561,7 +641,7 @@ pub const CallBuilder = struct {
                 if (tc != .array) return;
                 for (tc.array.items, 0..) |t, k| {
                     if (t != .object) continue;
-                    const idx: u32 = if (t.object.get("index")) |x| (if (x == .integer) @intCast(@max(0, x.integer)) else @intCast(k)) else @intCast(k);
+                    const idx = jsonIndex(t.object.get("index"), @intCast(k));
                     const p = self.at(idx) orelse continue;
                     if (getStr(t, "id")) |id| if (p.id.items.len == 0) p.id.appendSlice(id) catch {};
                     if (t.object.get("function")) |f| {
@@ -687,4 +767,28 @@ test "call builder and models" {
     var list = std.ArrayList([]const u8).init(a);
     try std.testing.expectEqual(@as(usize, 2), try parseModels(a, "{\"data\":[{\"id\":\"b\"},{\"id\":\"models/a\"}]}", &list));
     try std.testing.expectEqualStrings("a", list.items[0]);
+}
+
+test "user turn with images" {
+    var body = std.ArrayList(u8).init(std.testing.allocator);
+    defer body.deinit();
+    const turns = [_]Turn{.{ .role = .user, .content = "これは何?", .images = &.{.{ .mime = "image/png", .b64 = "QUJD" }} }};
+    try buildBody(&body, .anthropic, "m", "", &turns, &.{});
+    try std.testing.expect(std.mem.indexOf(u8, body.items, "\"content\":[{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":\"image/png\",\"data\":\"QUJD\"}},{\"type\":\"text\",\"text\":\"これは何?\"}]") != null);
+    body.clearRetainingCapacity();
+    try buildBody(&body, .openai, "m", "", &turns, &.{});
+    try std.testing.expect(std.mem.indexOf(u8, body.items, "\"content\":[{\"type\":\"text\",\"text\":\"これは何?\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,QUJD\"}}]") != null);
+    // 画像だけ(文が空)でも送る
+    body.clearRetainingCapacity();
+    try buildBody(&body, .openai, "m", "", &.{.{ .role = .user, .images = &.{.{ .mime = "image/jpeg", .b64 = "QQ==" }} }}, &.{});
+    try std.testing.expect(std.mem.indexOf(u8, body.items, "data:image/jpeg;base64,QQ==") != null);
+    // 会話の JSON の images
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const t = try parseConversation(arena.allocator(), "[{\"role\":\"user\",\"content\":\"x\",\"images\":[\"/a.png\",\"/b.jpg\"]}]");
+    try std.testing.expectEqual(@as(usize, 2), t[0].image_paths.len);
+    try std.testing.expectEqualStrings("/b.jpg", t[0].image_paths[1]);
+    try std.testing.expectEqualStrings("image/png", mimeOf("\x89PNG\r\n\x1a\n....").?);
+    try std.testing.expectEqualStrings("image/webp", mimeOf("RIFF\x00\x00\x00\x00WEBPVP8 ").?);
+    try std.testing.expect(mimeOf("hello") == null);
 }
